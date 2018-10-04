@@ -121,6 +121,7 @@ module CollectP {
     interface TagnetAdapter<uint32_t> as DblkLastRecOffset;
     interface TagnetAdapter<uint32_t> as DblkLastSyncOffset;
     interface TagnetAdapter<uint32_t> as DblkCommittedOffset;
+    interface TagnetAdapter<uint32_t> as DblkResyncOffset;
 
     /* private */
     interface Init;                     /* SoftwareInit */
@@ -141,12 +142,26 @@ module CollectP {
     interface Panic;
     interface DblkManager;
     interface SysReboot @atleastonce();
+    interface ByteMapFile as DMF;
+    interface Timer<TMilli> as ResyncTimer;
   }
 }
 
 implementation {
 
   norace dc_control_t dcc;
+
+
+  // structure to manage state variables for reSync operation
+  typedef struct {
+    error_t  err;           /* error encountered during search */
+    uint32_t cur_offset;    /* last place visited */
+    uint32_t term_offset;   /* offset to halt search */
+    uint32_t found_offset;  /* offset of found sync record, 0 if none */
+    bool in_progress;       /* search already in progress, try later */
+  } scb_t;
+
+  scb_t scb;                /* Sync Search Control Block (scb) */
 
 
   /*
@@ -297,10 +312,25 @@ implementation {
   }
 
 
+  command bool DblkResyncOffset.get_value(uint32_t *t, uint32_t *l) {
+    if (scb.in_progress)
+      *t = 0;
+    else
+      *t = scb.found_offset;
+    *l = sizeof(uint32_t);
+    return TRUE;
+  }
+
   command bool DblkLastRecNum.set_value(uint32_t *t, uint32_t *l)      { return FALSE; }
   command bool DblkLastRecOffset.set_value(uint32_t *t, uint32_t *l)   { return FALSE; }
   command bool DblkLastSyncOffset.set_value(uint32_t *t, uint32_t *l)  { return FALSE; }
   command bool DblkCommittedOffset.set_value(uint32_t *t, uint32_t *l) { return FALSE; }
+
+  command bool DblkResyncOffset.set_value(uint32_t *t, uint32_t *l) {
+    call Collect.resyncStart(t, *t+4000);
+    *l = sizeof(uint32_t);
+    return TRUE;
+  }
 
 
   /*
@@ -526,6 +556,162 @@ implementation {
     ep->arg3  = arg3;
     call Collect.collect((void *)ep, sizeof(e), NULL, 0);
   }
+
+
+/*
+ * Dblk Record Resync
+ *
+ * The following provides the resync functionality in the
+ * Collect interface. The primary purpose of resync is to
+ * find the proper record alignment in the dblk file.
+ * This is sometimes lost or corrupted due to system
+ * failures. Other times we just want to jump to an
+ * arbitrary position in the file and find the record
+ * boundary. The sync record is used as the marker
+ * for this alignment since it is laid down in the
+ * dblk file on a periodic basis and has a well known
+ * format for correctly matching.
+ *
+ * resyncStart   command to initiate a search for a sync
+ *               record starting at the specified offset
+ *               in the dblk file. The terminal offset
+ *               sets how far to search. If -1 then
+ *               search to end of file.
+ *               SUCCESS: found result, new offset
+ *                        returned
+ *               EODATA:  beyond end of file or terminal
+ *                        offset
+ *               EBUSY:   disk io is in progress, result
+ *                        will be signalled when done
+ *
+ * resyncDone    event to signal completion of search.
+ *               returns offset
+ *
+ * Assumptions
+ * - sync records are word aligned
+ * - sync records are fixed length
+ * - sync records can span across sector boundaries
+ * - sync record structure definition is fixed (any
+ *   future changes will affect this code)
+ * - majik field is last field in sync record structure
+ *
+ * Algorithm
+ * - if already searching, return EBUSY
+ * - start a deadman timer
+ * - initialize state variables
+ * - repeat until sync record found or unrecoverable error:
+ *   - call dmf.mapAll() with candidate offset and size of
+ *     sync record. It returns success if all data is
+ *     available or EBUSY if it needs to retrieve more data.
+ *     It signal dmf.data_avail when is data and can now be
+ *     accessed
+ *   - check buffer to see if sync record is present, look
+ *     for majik field, type, length, recsum
+ *   - if valid sync record, then signal Collect.resyncDone
+ *     and record file offset
+ *   - otherwise, increment the offset by 4 bytes and try
+ *     again
+ * - terminate search and return EODATA when terminal
+ *   offset has been exceeded or end of file is detected
+ * - return SUCCESS and offset where sync record is located
+ *   if sync record is detected
+ *
+ */
+
+  /*
+   * checksum routine for records within a single block
+   */
+  bool recsum_valid() {
+    nop();                              /* BRK */
+    return TRUE;
+  }
+
+
+  /*
+   * core routine for finding sync records
+   */
+  uint32_t sync_search() {
+    dt_sync_t    *sync;
+    uint32_t      dlen = sizeof(dt_sync_t);
+
+    scb.err = EODATA;
+    while(scb.cur_offset < scb.term_offset) {
+      scb.err = call DMF.map(0, (uint8_t **) &sync, scb.cur_offset, &dlen);
+      if(scb.err != SUCCESS)
+        return 0; /* in case of EBUSY, sync_search is called again */
+      if (dlen != sizeof(dt_sync_t))
+        call Panic.panic(PANIC_SS, 5, dlen, (uint32_t) sync, 0,0);
+      if ((sync->sync_majik == SYNC_MAJIK) &&
+          (sync->dtype == DT_SYNC) &&
+          (sync->len == sizeof(dt_sync_t)) &&
+          (recsum_valid()))
+        return scb.cur_offset - sizeof(dt_sync_t);
+      scb.cur_offset += sizeof(uint32_t);
+    }
+    return 0;
+  }
+
+  /*
+   * start the resync operation.
+   */
+  command error_t Collect.resyncStart(uint32_t *p_offset, uint32_t term_offset) {
+
+    if (!p_offset)
+      call Panic.panic(PANIC_SS, 6, 0,0,0,0);
+
+    if (scb.in_progress) return EBUSY;
+
+    scb.in_progress = TRUE;
+    call ResyncTimer.startOneShot(1000);
+
+    scb.cur_offset = *p_offset & ~3; // round start offset to word boundary
+    scb.term_offset = term_offset;
+    scb.found_offset = 0;
+
+    // look for sync record
+    *p_offset = sync_search();
+
+    // found sync at returned offset
+    if (*p_offset) {
+      call ResyncTimer.stop();
+      scb.in_progress = FALSE;
+      scb.err = SUCCESS;
+    }
+    // detected unrecoverable error, terminate search
+    else if (scb.err != EBUSY) {
+      *p_offset = -scb.err; // denote error
+      call ResyncTimer.stop();
+      scb.in_progress = FALSE;
+    }
+    // else busy reading next sector, try again later
+    scb.found_offset = *p_offset;
+    return scb.err;
+  }
+
+  /*
+   *
+   */
+  task void SyncSearchTask() {
+    if ((scb.found_offset = sync_search()) || (scb.err != EBUSY)) {
+      call ResyncTimer.stop();
+      scb.in_progress = FALSE;
+      signal Collect.resyncDone(scb.err, scb.found_offset);
+    }
+  }
+
+
+  event void DMF.data_avail(error_t err) {
+    post SyncSearchTask();
+  }
+
+  event void ResyncTimer.fired() {
+    if (scb.in_progress)
+      call Panic.panic(PANIC_SS, 7, 0,0,0,0);
+  }
+
+  event void DMF.extended(uint32_t context, uint32_t offset)  { }
+  event void DMF.committed(uint32_t context, uint32_t offset) { }
+  default event void Collect.resyncDone(error_t err, uint32_t offset) { }
 
 
   async event void SysReboot.shutdown_flush() {

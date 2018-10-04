@@ -33,4 +33,16 @@ interface Collect {
 
   /* signal on Boot that Collect is happy and up */
   event void collectBooted();
+
+  /* begin search for next sync from starting offset.
+   * if sync is found from immediate search in dblk map cache,
+   * then will return with offset of sync found. If it needs
+   * to search the dblk file, it return EBUSY and will signal
+   * completion when done. Otherwise, error code indicates
+   * non-recoverable error.
+   */
+  command error_t resyncStart(uint32_t *p_offset, uint32_t term_offset);
+
+  /* indicate search is complete */
+  event void resyncDone(error_t err, uint32_t offset);
 }
