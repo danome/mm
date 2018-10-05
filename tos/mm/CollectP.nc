@@ -577,6 +577,7 @@ implementation {
  *               in the dblk file. The terminal offset
  *               sets how far to search. If -1 then
  *               search to end of file.
+ *
  *               SUCCESS: found result, new offset
  *                        returned
  *               EODATA:  beyond end of file or terminal

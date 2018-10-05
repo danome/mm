@@ -34,15 +34,38 @@ interface Collect {
   /* signal on Boot that Collect is happy and up */
   event void collectBooted();
 
-  /* begin search for next sync from starting offset.
-   * if sync is found from immediate search in dblk map cache,
-   * then will return with offset of sync found. If it needs
-   * to search the dblk file, it return EBUSY and will signal
-   * completion when done. Otherwise, error code indicates
-   * non-recoverable error.
+  /**
+   * resyncStart: request a Dblk resync
+   *
+   * Starting at the request offset, find the first SYNC record
+   * if possible.
+   *
+   * @param uint32_t *p_offset   pointer to the offset.
+   * @param uint32_t term_offset limiting offset.  (inclusive or exclusive?)
+   *
+   * @return error_t    SUCCESS if a SYNC was found and is cached.
+   *                    EBUSY   SYNC not found yet, accessing Dblk subsystem.
+   * @param uint32_t *p_offset updated with found offset (iff SUCCESS).
+   *
+   * if EBUSY is returned, a resyncDone signal will be generated at the
+   * completion of the algorithm.
+   *
+   * non-SUCCESS and non-EBUSY indicate a non-recoverable error.
    */
   command error_t resyncStart(uint32_t *p_offset, uint32_t term_offset);
 
-  /* indicate search is complete */
+  /**
+   * resyncDone: signal completion of resync process
+   *
+   * @param error_t err result
+   *                    SUCCESS, offset contains the offset of the cached
+   *                             SYNC record.
+   *                    other, something went wrong.
+   *
+   * @param uint32_t offset, offset of the cached SYNC record (if found).
+   *
+   * SUCCESS indicates the resync finished.  Unexpected errors will Panic.
+   * see code for returns that matter.
+   */
   event void resyncDone(error_t err, uint32_t offset);
 }
